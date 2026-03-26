@@ -1,0 +1,123 @@
+require('dotenv').config();
+const dns = require('dns');
+
+// Fix for querySrv ECONNREFUSED issues on some networks
+if (dns.setServers) {
+  dns.setServers(['8.8.8.8', '8.8.4.4']);
+}
+
+const express = require('express');
+const mongoose = require('mongoose');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const admin = require('firebase-admin');
+const DeviceData = require('./models/DeviceData');
+
+// Initialize Firebase Admin
+const serviceAccount = require('./serviceAccountKey.json');
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount)
+});
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/tracking_app';
+console.log('Using MongoDB URI:', MONGODB_URI);
+
+// Middleware
+app.use(cors());
+app.use(bodyParser.json({ limit: '50mb' }));
+app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
+
+// MongoDB Connection
+mongoose.connect(MONGODB_URI)
+  .then(() => console.log('Connected to MongoDB'))
+  .catch(err => console.error('MongoDB connection error:', err));
+
+// Routes
+// Receiving data from the app
+app.post('/api/submit', async (req, res) => {
+  try {
+    const data = req.body;
+    const deviceId = data.deviceId || data.device_id;
+    
+    if (!deviceId) {
+      return res.status(400).json({ error: 'deviceId or device_id is required' });
+    }
+
+    // Map location if it's a string to location_string to avoid schema collision
+    if (typeof data.location === 'string') {
+      data.location_string = data.location;
+      // We don't delete data.location because strict: false might still try to save it, 
+      // but the schema definition for 'location' is an object.
+      // However, with strict: false and a defined 'location' as object, 
+      // Mongoose might struggle if it gets a string. 
+      // Let's ensure it's handled.
+    }
+
+    // Helper to parse stringified JSON fields if they arrive as strings
+    const parseField = (field) => {
+      if (typeof field === 'string') {
+        try {
+          return JSON.parse(field);
+        } catch (e) {
+          return field;
+        }
+      }
+      return field;
+    };
+
+    // Parse any top-level stringified JSON fields automatically
+    Object.keys(data).forEach(key => {
+      if (typeof data[key] === 'string' && (data[key].startsWith('{') || data[key].startsWith('['))) {
+        try {
+          data[key] = JSON.parse(data[key]);
+        } catch (e) {
+          // Keep as string if parsing fails
+        }
+      }
+    });
+
+    const newEntry = new DeviceData(data);
+    newEntry.deviceId = deviceId; // Ensure deviceId is set for the model
+    await newEntry.save({ validateBeforeSave: false });
+
+    console.log(`Data saved for device: ${deviceId} at ${new Date().toISOString()}`);
+    res.status(201).json({ message: 'Data saved successfully', id: newEntry._id });
+  } catch (err) {
+    console.error('Error saving data:', err);
+    res.status(500).json({ error: 'Internal server error', details: err.message });
+  }
+});
+
+// Status endpoint
+app.get('/api/status', (req, res) => {
+  res.json({ status: 'Backend is running' });
+});
+
+// Sending FCM notification
+app.post('/api/send-notification', async (req, res) => {
+  try {
+    const { to, data } = req.body;
+
+    if (!to) {
+      return res.status(400).json({ error: 'Recipient token (to) is required' });
+    }
+
+    const message = {
+      token: to,
+      data: data || {}
+    };
+
+    const response = await admin.messaging().send(message);
+    console.log('Successfully sent message:', response);
+    res.status(200).json({ message: 'Notification sent successfully', response });
+  } catch (err) {
+    console.error('Error sending notification:', err);
+    res.status(500).json({ error: 'Failed to send notification', details: err.message });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Server is running on port ${PORT}`);
+});
