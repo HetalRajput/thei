@@ -14,10 +14,27 @@ const admin = require('firebase-admin');
 const DeviceData = require('./models/DeviceData');
 
 // Initialize Firebase Admin
-const serviceAccount = require('./serviceAccountKey.json');
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
+let serviceAccount;
+if (process.env.FIREBASE_PROJECT_ID) {
+  serviceAccount = {
+    projectId: process.env.FIREBASE_PROJECT_ID,
+    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    // Replace literal '\n' with actual linebreaks so the private key works
+    privateKey: process.env.FIREBASE_PRIVATE_KEY ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n') : undefined
+  };
+} else {
+  try {
+    serviceAccount = require('./serviceAccountKey.json');
+  } catch (err) {
+    console.warn("No Firebase service account found. Please provide env vars or serviceAccountKey.json");
+  }
+}
+
+if (serviceAccount) {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount)
+  });
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
