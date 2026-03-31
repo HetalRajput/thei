@@ -7,6 +7,8 @@ if (dns.setServers) {
 }
 
 const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
 const mongoose = require('mongoose');
 const bodyParser = require('body-parser');
 const cors = require('cors');
@@ -37,6 +39,14 @@ if (serviceAccount) {
 }
 
 const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/tracking_app';
 console.log('Using MongoDB URI:', MONGODB_URI);
@@ -130,11 +140,61 @@ app.post('/api/send-notification', async (req, res) => {
     console.log('Successfully sent message:', response);
     res.status(200).json({ message: 'Notification sent successfully', response });
   } catch (err) {
+    // FCM token is no longer valid (app uninstalled, token rotated, etc.)
+    if (err.errorInfo && err.errorInfo.code === 'messaging/registration-token-not-registered') {
+      console.warn(`FCM token is no longer registered (stale/expired): ${req.body.to}`);
+
+      // Optional: remove the stale token from the database
+      try {
+        await DeviceData.updateMany(
+          { fcmToken: req.body.to },
+          { $unset: { fcmToken: '' } }
+        );
+        console.log('Stale FCM token removed from database.');
+      } catch (dbErr) {
+        console.error('Failed to remove stale token from DB:', dbErr.message);
+      }
+
+      return res.status(410).json({
+        error: 'FCM token is no longer registered. The device token is stale or expired.',
+        code: err.errorInfo.code
+      });
+    }
+
     console.error('Error sending notification:', err);
     res.status(500).json({ error: 'Failed to send notification', details: err.message });
   }
 });
 
-app.listen(PORT, () => {
+// Socket.io connection handler
+io.on('connection', (socket) => {
+  // Extract device_id from query or auth object
+  const deviceId = socket.handshake.query.device_id || socket.handshake.auth.device_id;
+  
+  if (deviceId) {
+    socket.deviceId = deviceId;
+    socket.join(deviceId); // Join a room named by deviceId for targeted emits
+    console.log(`[Socket] New client: ${socket.id} (Device ID: ${deviceId}) joined room: ${deviceId}`);
+  } else {
+    console.log(`[Socket] New client: ${socket.id} (No Device ID provided)`);
+  }
+
+  // Also listen for an explicit 'device_id' event in case it's sent after connection
+  socket.on('device_id', (data) => {
+    const receivedId = typeof data === 'string' ? data : data.device_id;
+    if (receivedId) {
+      socket.deviceId = receivedId;
+      socket.join(receivedId);
+      console.log(`[Socket] Received Device ID via event from ${socket.id}: ${receivedId}`);
+      socket.emit('device_id_confirmed', { device_id: receivedId });
+    }
+  });
+
+  socket.on('disconnect', () => {
+    console.log(`[Socket] Client disconnected: ${socket.id}${socket.deviceId ? ` (Device ID: ${socket.deviceId})` : ''}`);
+  });
+});
+
+server.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
