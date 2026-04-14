@@ -13,7 +13,27 @@ const mongoose = require('mongoose');
 const bodyParser = require('body-parser');
 const cors = require('cors');
 const admin = require('firebase-admin');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 const DeviceData = require('./models/DeviceData');
+
+// Create uploads directory if it doesn't exist
+const uploadDir = 'uploads';
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir);
+}
+
+// Multer storage configuration
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    cb(null, `${Date.now()}-${file.originalname}`);
+  }
+});
+const upload = multer({ storage: storage });
 
 // Initialize Firebase Admin
 let serviceAccount;
@@ -52,9 +72,15 @@ const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/tracki
 console.log('Using MongoDB URI:', MONGODB_URI);
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: '*', // Allow all for debugging
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use('/streams', express.static(path.join(__dirname, 'streams')));
 
 // MongoDB Connection
 mongoose.connect(MONGODB_URI)
@@ -62,8 +88,8 @@ mongoose.connect(MONGODB_URI)
   .catch(err => console.error('MongoDB connection error:', err));
 
 // Routes
-// Receiving data from the app
-app.post('/api/submit', async (req, res) => {
+// Receiving data from the app (supports both JSON and Multipart/Form-Data for images)
+app.post('/api/submit', upload.single('image'), async (req, res) => {
   try {
     const data = req.body;
     const deviceId = data.deviceId || data.device_id;
@@ -72,27 +98,17 @@ app.post('/api/submit', async (req, res) => {
       return res.status(400).json({ error: 'deviceId or device_id is required' });
     }
 
+    // If a file was uploaded, add its path to the data
+    if (req.file) {
+      data.imageUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+      data.imagePath = req.file.path;
+      console.log(`Image received and saved: ${req.file.filename}`);
+    }
+
     // Map location if it's a string to location_string to avoid schema collision
     if (typeof data.location === 'string') {
       data.location_string = data.location;
-      // We don't delete data.location because strict: false might still try to save it, 
-      // but the schema definition for 'location' is an object.
-      // However, with strict: false and a defined 'location' as object, 
-      // Mongoose might struggle if it gets a string. 
-      // Let's ensure it's handled.
     }
-
-    // Helper to parse stringified JSON fields if they arrive as strings
-    const parseField = (field) => {
-      if (typeof field === 'string') {
-        try {
-          return JSON.parse(field);
-        } catch (e) {
-          return field;
-        }
-      }
-      return field;
-    };
 
     // Parse any top-level stringified JSON fields automatically
     Object.keys(data).forEach(key => {
@@ -110,7 +126,11 @@ app.post('/api/submit', async (req, res) => {
     await newEntry.save({ validateBeforeSave: false });
 
     console.log(`Data saved for device: ${deviceId} at ${new Date().toISOString()}`);
-    res.status(201).json({ message: 'Data saved successfully', id: newEntry._id });
+    res.status(201).json({ 
+      message: 'Data saved successfully', 
+      id: newEntry._id,
+      imageUrl: data.imageUrl || null 
+    });
   } catch (err) {
     console.error('Error saving data:', err);
     res.status(500).json({ error: 'Internal server error', details: err.message });
@@ -163,6 +183,49 @@ app.post('/api/send-notification', async (req, res) => {
 
     console.error('Error sending notification:', err);
     res.status(500).json({ error: 'Failed to send notification', details: err.message });
+  }
+});
+
+// Admin routes
+app.get('/api/admin/data', async (req, res) => {
+  try {
+    const data = await DeviceData.find().sort({ submittedAt: -1 });
+    res.status(200).json(data);
+  } catch (err) {
+    console.error('Error fetching admin data:', err);
+    res.status(500).json({ error: 'Internal server error', details: err.message });
+  }
+});
+
+// Admin route to get data for a specific device
+app.get('/api/admin/device/:deviceId', async (req, res) => {
+  try {
+    const { deviceId } = req.params;
+    const data = await DeviceData.find({ deviceId }).sort({ submittedAt: -1 });
+    res.status(200).json(data);
+  } catch (err) {
+    console.error(`Error fetching data for device ${req.params.deviceId}:`, err);
+    res.status(500).json({ error: 'Internal server error', details: err.message });
+  }
+});
+
+// Admin route to get latest data for each unique device
+app.get('/api/admin/devices', async (req, res) => {
+  try {
+    const devices = await DeviceData.aggregate([
+      { $sort: { submittedAt: -1 } },
+      {
+        $group: {
+          _id: "$deviceId",
+          latestSubmission: { $first: "$$ROOT" }
+        }
+      },
+      { $replaceRoot: { newRoot: "$latestSubmission" } }
+    ]);
+    res.status(200).json(devices);
+  } catch (err) {
+    console.error('Error fetching unique devices:', err);
+    res.status(500).json({ error: 'Internal server error', details: err.message });
   }
 });
 
