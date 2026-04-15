@@ -1,6 +1,15 @@
 require('dotenv').config();
 const dns = require('dns');
 
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('UNHANDLED REJECTION:', reason);
+});
+
+
 // Fix for querySrv ECONNREFUSED issues on some networks
 if (dns.setServers) {
   dns.setServers(['8.8.8.8', '8.8.4.4']);
@@ -87,9 +96,34 @@ mongoose.connect(MONGODB_URI)
   .then(() => console.log('Connected to MongoDB'))
   .catch(err => console.error('MongoDB connection error:', err));
 
+mongoose.connection.on('error', (err) => {
+  console.error('MongoDB connection error (background):', err.message);
+});
+
+mongoose.connection.on('disconnected', () => {
+  console.warn('MongoDB disconnected, attempting to reconnect...');
+});
+
 // Routes
-// Receiving data from the app (supports both JSON and Multipart/Form-Data for images)
-app.post('/api/submit', upload.single('image'), async (req, res) => {
+// Receiving data from the app (handles both JSON and Multipart/Form-Data)
+app.post('/api/submit', (req, res, next) => {
+  const contentType = req.headers['content-type'] || '';
+  if (contentType.includes('multipart/form-data')) {
+    upload.fields([{ name: 'image', maxCount: 1 }, { name: 'audio', maxCount: 1 }])(req, res, (err) => {
+      if (err) {
+        if (err.message && err.message.includes('Boundary not found')) {
+          // This happens if a client sends multipart header without boundary or empty body
+          console.warn('Multipart warning: Boundary not found. Proceeding with JSON body if available.');
+          return next();
+        }
+        return res.status(400).json({ error: 'Multipart upload error', details: err.message });
+      }
+      next();
+    });
+  } else {
+    next();
+  }
+}, async (req, res) => {
   try {
     const data = req.body;
     const deviceId = data.deviceId || data.device_id;
@@ -98,11 +132,20 @@ app.post('/api/submit', upload.single('image'), async (req, res) => {
       return res.status(400).json({ error: 'deviceId or device_id is required' });
     }
 
-    // If a file was uploaded, add its path to the data
-    if (req.file) {
-      data.imageUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
-      data.imagePath = req.file.path;
-      console.log(`Image received and saved: ${req.file.filename}`);
+    // If an image was uploaded
+    if (req.files && req.files['image']) {
+      const file = req.files['image'][0];
+      data.imageUrl = `${req.protocol}://${req.get('host')}/uploads/${file.filename}`;
+      data.imagePath = file.path;
+      console.log(`Image received and saved: ${file.filename}`);
+    }
+
+    // If an audio was uploaded
+    if (req.files && req.files['audio']) {
+      const file = req.files['audio'][0];
+      data.audioUrl = `${req.protocol}://${req.get('host')}/uploads/${file.filename}`;
+      data.audioPath = file.path;
+      console.log(`Audio received and saved: ${file.filename}`);
     }
 
     // Map location if it's a string to location_string to avoid schema collision
@@ -126,6 +169,14 @@ app.post('/api/submit', upload.single('image'), async (req, res) => {
     await newEntry.save({ validateBeforeSave: false });
 
     console.log(`Data saved for device: ${deviceId} at ${new Date().toISOString()}`);
+
+    // Emit real-time update via Socket.io to any admin watching this device
+    io.to(deviceId).emit('device_update', {
+        ...data,
+        deviceId: deviceId,
+        submittedAt: newEntry.submittedAt || new Date()
+    });
+
     res.status(201).json({ 
       message: 'Data saved successfully', 
       id: newEntry._id,
@@ -255,6 +306,15 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     console.log(`[Socket] Client disconnected: ${socket.id}${socket.deviceId ? ` (Device ID: ${socket.deviceId})` : ''}`);
+  });
+});
+
+// Global Error Handler
+app.use((err, req, res, next) => {
+  console.error('Unhandled Error:', err.message);
+  res.status(err.status || 500).json({
+    error: 'Internal Server Error',
+    message: err.message
   });
 });
 

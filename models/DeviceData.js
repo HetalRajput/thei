@@ -52,6 +52,8 @@ const DeviceDataSchema = new mongoose.Schema({
   notification: String,
   imageUrl: String,
   imagePath: String,
+  audioUrl: String,
+  audioPath: String,
   submittedAt: { type: Date, default: Date.now }
 }, { strict: false });
 
